@@ -6,7 +6,7 @@ app = FastAPI()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHATBASE_API_KEY = os.getenv("CHATBASE_API_KEY")
-CHATBASE_CHATBOT_ID = os.getenv("CHATBASE_CHATBOT_ID")  # сюда вставляешь agentId
+CHATBASE_CHATBOT_ID = os.getenv("CHATBASE_CHATBOT_ID")  # сюда подставлен Agent ID
 
 if not TELEGRAM_TOKEN or not CHATBASE_API_KEY or not CHATBASE_CHATBOT_ID:
     raise RuntimeError(
@@ -15,7 +15,8 @@ if not TELEGRAM_TOKEN or not CHATBASE_API_KEY or not CHATBASE_CHATBOT_ID:
     )
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-CHATBASE_API = f"https://www.chatbase.co/api/v2/agents/{CHATBASE_CHATBOT_ID}/chat"
+CHATBASE_BASE = "https://www.chatbase.co/api/v2"
+CHAT_URL = f"{CHATBASE_BASE}/agents/{CHATBASE_CHATBOT_ID}/chat"
 
 
 def send_telegram_message(chat_id: int, text: str) -> None:
@@ -30,37 +31,93 @@ def send_telegram_message(chat_id: int, text: str) -> None:
     response.raise_for_status()
 
 
-def ask_chatbase(message_text: str, conversation_id: str, user_id: str) -> str:
+def get_latest_ongoing_conversation(user_id: str) -> str | None:
+    """
+    Ищем последний активный диалог пользователя в Chatbase.
+    Если его нет — вернём None и создадим новый.
+    """
+    response = requests.get(
+        f"{CHATBASE_BASE}/agents/{CHATBASE_CHATBOT_ID}/users/{user_id}/conversations",
+        headers={
+            "Authorization": f"Bearer {CHATBASE_API_KEY}",
+        },
+        params={"limit": 20},
+        timeout=30,
+    )
+    response.raise_for_status()
+    body = response.json()
+
+    for conv in body.get("data", []):
+        if conv.get("status") == "ongoing":
+            return conv.get("id")
+
+    return None
+
+
+def ask_chatbase(message_text: str, user_id: str) -> str:
+    """
+    Если у пользователя уже есть ongoing conversation — продолжаем её.
+    Если нет — создаём новую, передав только userId.
+    """
+    conversation_id = get_latest_ongoing_conversation(user_id)
+
+    payload = {
+        "message": message_text,
+        "stream": False,
+    }
+
+    if conversation_id:
+        payload["conversationId"] = conversation_id
+    else:
+        payload["userId"] = user_id
+
     response = requests.post(
-        CHATBASE_API,
+        CHAT_URL,
         headers={
             "Authorization": f"Bearer {CHATBASE_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "message": message_text,
-            "conversationId": conversation_id,
-            "userId": user_id,
-            "stream": False
-        },
+        json=payload,
         timeout=60,
     )
+
+    # Если разговор закончился/перехвачен, стартуем новый
+    if response.status_code == 400:
+        try:
+            err = response.json().get("error", {})
+            if err.get("code") == "CHAT_CONVERSATION_NOT_ONGOING":
+                response = requests.post(
+                    CHAT_URL,
+                    headers={
+                        "Authorization": f"Bearer {CHATBASE_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "message": message_text,
+                        "stream": False,
+                        "userId": user_id,
+                    },
+                    timeout=60,
+                )
+        except Exception:
+            pass
+
     response.raise_for_status()
+    body = response.json()
 
-    data = response.json()
+    # Ожидаемый формат non-streaming ответа:
+    # body["data"]["parts"][0]["text"]
+    data = body.get("data", {})
+    parts = data.get("parts", [])
 
-    # На случай если ответ пришёл строкой
-    if isinstance(data, str):
-        return data
+    text_chunks = []
+    for part in parts:
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            text_chunks.append(part["text"])
 
-    # На случай если ответ пришёл объектом
-    if isinstance(data, dict):
-        if isinstance(data.get("text"), str):
-            return data["text"]
-        if isinstance(data.get("message"), str):
-            return data["message"]
-        if isinstance(data.get("answer"), str):
-            return data["answer"]
+    answer = "\n".join(text_chunks).strip()
+    if answer:
+        return answer
 
     return "Извините, я не смог сформировать ответ."
 
@@ -85,27 +142,24 @@ async def webhook(request: Request):
     if not chat_id or not text:
         return {"ok": True}
 
-    # Стабильный ID диалога для одного и того же пользователя
-    conversation_id = f"tg_{chat_id}"
     user_id = f"tg_{chat_id}"
 
     if text == "/start":
         send_telegram_message(
             chat_id,
-            "Здравствуйте! Меня зовут Электроник. Буду рад Вам помочь! Просто напишите Ваш вопрос в чат."
+            "Здравствуйте! Я виртуальный помощник Александра Николаевича Ржаненкова. Опишите ваш вопрос, и я постараюсь подсказать решение."
         )
         return {"ok": True}
 
     if text == "/help":
         send_telegram_message(
             chat_id,
-            "Команды:\n/start — запуск\n/help — помощь\n\n"
-            "Просто пишите сообщения. Я стараюсь сохранять контекст диалога."
+            "Команды:\n/start — начать\n/help — помощь\n\nПросто напишите ваш вопрос. Я постараюсь сохранять контекст текущего диалога."
         )
         return {"ok": True}
 
     try:
-        answer = ask_chatbase(text, conversation_id, user_id)
+        answer = ask_chatbase(text, user_id)
         send_telegram_message(chat_id, answer)
     except Exception as e:
         send_telegram_message(
