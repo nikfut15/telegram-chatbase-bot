@@ -34,10 +34,7 @@ redis = Redis(
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 CHATBASE_API = "https://www.chatbase.co/api/v1/chat"
 
-# Сколько сообщений держать в контексте
 MAX_CONTEXT_MESSAGES = 12
-
-# TTL истории в секундах: 30 дней
 HISTORY_TTL_SECONDS = 30 * 24 * 60 * 60
 
 
@@ -52,10 +49,7 @@ def get_conversation_key(chat_id: int) -> str:
 def send_telegram_message(chat_id: int, text: str) -> None:
     response = requests.post(
         f"{TELEGRAM_API}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-        },
+        json={"chat_id": chat_id, "text": text},
         timeout=30,
     )
     response.raise_for_status()
@@ -71,55 +65,63 @@ def send_telegram_chat_action(chat_id: int, action: str = "typing") -> None:
 
 def get_history(chat_id: int, limit: int = MAX_CONTEXT_MESSAGES) -> list:
     key = get_history_key(chat_id)
-
-    # Берём последние N сообщений
     items = redis.lrange(key, -limit, -1) or []
+
+    print("DEBUG get_history raw items:", items)
 
     history = []
     for item in items:
         if isinstance(item, bytes):
             item = item.decode("utf-8")
 
-        if isinstance(item, str):
+        # Иногда клиент Upstash уже возвращает dict
+        if isinstance(item, dict):
+            parsed = item
+        elif isinstance(item, str):
             try:
                 parsed = json.loads(item)
-                if (
-                    isinstance(parsed, dict)
-                    and parsed.get("role") in {"user", "assistant"}
-                    and parsed.get("content")
-                ):
-                    history.append(
-                        {
-                            "role": parsed["role"],
-                            "content": parsed["content"],
-                        }
-                    )
-            except Exception:
+            except Exception as e:
+                print("DEBUG json.loads failed:", e, " item=", item)
                 continue
+        else:
+            print("DEBUG unknown item type:", type(item), item)
+            continue
 
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("role") in {"user", "assistant"}
+            and parsed.get("content")
+        ):
+            history.append(
+                {
+                    "role": parsed["role"],
+                    "content": parsed["content"],
+                }
+            )
+
+    print("DEBUG parsed history:", history)
     return history
 
 
 def append_message(chat_id: int, role: str, content: str) -> None:
     key = get_history_key(chat_id)
 
-    redis.rpush(
-        key,
-        json.dumps(
-            {
-                "role": role,
-                "content": content,
-            },
-            ensure_ascii=False,
-        ),
+    value = json.dumps(
+        {
+            "role": role,
+            "content": content,
+        },
+        ensure_ascii=False,
     )
 
-    # Обрезаем историю до последних 40 сообщений,
-    # чтобы Redis не раздувался
-    redis.ltrim(key, -40, -1)
+    print("DEBUG append_message key:", key)
+    print("DEBUG append_message value:", value)
 
-    # Продлеваем TTL
+    redis.rpush(key, value)
+    redis.ltrim(key, -40, -1)
     redis.expire(key, HISTORY_TTL_SECONDS)
+
+    print("DEBUG history after append:", redis.lrange(key, 0, -1))
 
 
 def clear_history(chat_id: int) -> None:
@@ -138,6 +140,7 @@ def get_or_create_conversation_id(chat_id: int) -> str:
         conversation_id = f"tg_{chat_id}"
         redis.set(key, conversation_id, ex=HISTORY_TTL_SECONDS)
 
+    print("DEBUG conversation_id:", conversation_id)
     return conversation_id
 
 
@@ -153,6 +156,8 @@ def ask_chatbase(chat_id: int, message_text: str) -> str:
             "content": message_text,
         }
     ]
+
+    print("DEBUG messages to Chatbase:", messages)
 
     payload = {
         "chatbotId": CHATBASE_CHATBOT_ID,
@@ -171,6 +176,10 @@ def ask_chatbase(chat_id: int, message_text: str) -> str:
         json=payload,
         timeout=90,
     )
+
+    print("DEBUG Chatbase status:", response.status_code)
+    print("DEBUG Chatbase response text:", response.text)
+
     response.raise_for_status()
     data = response.json()
 
@@ -186,12 +195,13 @@ def ask_chatbase(chat_id: int, message_text: str) -> str:
 
 @app.get("/")
 def root():
-    return {"ok": True, "message": "Telegram + Chatbase bot is running"}
+    return {"ok": True, "message": "Telegram + Chatbase bot is running", "debug_version": "v2-debug"}
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
     update = await request.json()
+    print("DEBUG incoming update:", update)
 
     message = update.get("message")
     if not message:
@@ -201,6 +211,9 @@ async def webhook(request: Request):
     chat_id = chat.get("id")
     text = message.get("text")
 
+    print("DEBUG chat_id:", chat_id)
+    print("DEBUG text:", text)
+
     if not chat_id or not text:
         return {"ok": True}
 
@@ -209,20 +222,14 @@ async def webhook(request: Request):
     if text == "/start":
         send_telegram_message(
             chat_id,
-            "Привет! Я подключён к Chatbase через Telegram.\n"
-            "Контекст диалога сохраняется.\n\n"
-            "/reset — очистить память диалога"
+            "Привет! Контекст должен сохраняться.\n/reset — очистить историю\nDEBUG VERSION: v2-debug"
         )
         return {"ok": True}
 
     if text == "/help":
         send_telegram_message(
             chat_id,
-            "Команды:\n"
-            "/start — запуск\n"
-            "/help — помощь\n"
-            "/reset — сбросить историю\n\n"
-            "Просто отправляй сообщения."
+            "Команды:\n/start\n/help\n/reset\nDEBUG VERSION: v2-debug"
         )
         return {"ok": True}
 
@@ -242,11 +249,10 @@ async def webhook(request: Request):
         send_telegram_message(chat_id, answer)
 
     except Exception as e:
-        print("ERROR:", str(e))
+        print("DEBUG ERROR:", repr(e))
         send_telegram_message(
             chat_id,
-            "Произошла ошибка при обращении к AI. "
-            "Проверь настройки Vercel, Upstash и Chatbase."
+            "Произошла ошибка при обращении к AI. Проверь Vercel logs."
         )
 
     return {"ok": True}
